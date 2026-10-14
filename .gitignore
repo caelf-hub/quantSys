@@ -1,0 +1,5 @@
+build/
+data/
+*.bin
+*.gz
+*.o
