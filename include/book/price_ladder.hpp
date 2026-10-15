@@ -39,9 +39,12 @@ public:
 
     size_t num_ticks() const { return levels_.size(); }
 
+    uint32_t raw_at_tick(int32_t tick) const {
+        return min_price_raw_ + static_cast<uint32_t>(tick) * tick_size_raw_;
+    }
+
     double price_at_tick(int32_t tick) const {
-        uint32_t price_raw = min_price_raw_ + static_cast<uint32_t>(tick) * tick_size_raw_;
-        return static_cast<double>(price_raw) / 10000.0; // ITCH Price(4): 4 implied decimals
+        return static_cast<double>(raw_at_tick(tick)) / 10000.0; // ITCH Price(4): 4 implied decimals
     }
 
 private:

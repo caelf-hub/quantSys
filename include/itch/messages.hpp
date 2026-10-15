@@ -167,6 +167,31 @@ inline OrderReplace parse_order_replace(const uint8_t* buf) {
     return m;
 }
 
+// Message type 'P' -- Trade (non-cross). An execution against a
+// non-displayed order. It never touches the displayed book. The order
+// reference is zeroed in the public feed.
+struct Trade {
+    Header header;
+    uint64_t order_ref_number;
+    char buy_sell_indicator; // side of the resting non-displayed order
+    uint32_t shares;
+    std::array<char, 8> stock;
+    uint32_t price_raw;
+    uint64_t match_number;
+};
+
+inline Trade parse_trade(const uint8_t* buf) {
+    Trade m;
+    m.header = parse_header(buf);
+    m.order_ref_number = read_be64(buf + 11);
+    m.buy_sell_indicator = static_cast<char>(buf[19]);
+    m.shares = read_be32(buf + 20);
+    std::memcpy(m.stock.data(), buf + 24, 8);
+    m.price_raw = read_be32(buf + 32);
+    m.match_number = read_be64(buf + 36);
+    return m;
+}
+
 // Price fields have an implied 4 decimal places (per spec Data Types section).
 inline double price_to_double(uint32_t price_raw) {
     return static_cast<double>(price_raw) / 10000.0;

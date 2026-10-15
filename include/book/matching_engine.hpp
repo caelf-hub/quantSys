@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "occupied_ticks.hpp"
 #include "order_pool.hpp"
 #include "price_ladder.hpp"
 
@@ -26,7 +27,9 @@ public:
                    size_t max_orders)
         : pool_(max_orders),
           bids_(min_price_raw, max_price_raw, tick_size_raw),
-          asks_(min_price_raw, max_price_raw, tick_size_raw) {
+          asks_(min_price_raw, max_price_raw, tick_size_raw),
+          bid_ticks_(bids_.num_ticks()),
+          ask_ticks_(asks_.num_ticks()) {
         order_locations_.reserve(max_orders);
     }
 
@@ -64,7 +67,10 @@ public:
         pool_.free(loc.pool_index);
         order_locations_.erase(it);
 
-        if (level.order_count == 0) update_best_on_empty(loc.side, loc.tick);
+        if (level.order_count == 0) {
+            occupied(loc.side).clear(loc.tick);
+            update_best_on_empty(loc.side, loc.tick);
+        }
         return true;
     }
 
@@ -74,7 +80,16 @@ public:
     double best_ask() const {
         return best_ask_tick_ < 0 ? -1.0 : asks_.price_at_tick(best_ask_tick_);
     }
+    uint64_t best_bid_shares() const {
+        if (best_bid_tick_ < 0) return 0;
+        return bids_.level_at(best_bid_tick_).total_shares;
+    }
+    uint64_t best_ask_shares() const {
+        if (best_ask_tick_ < 0) return 0;
+        return asks_.level_at(best_ask_tick_).total_shares;
+    }
     size_t resting_order_count() const { return order_locations_.size(); }
+    uint64_t pool_exhausted() const { return pool_exhausted_; }
 
 private:
     struct OrderLocation {
@@ -87,19 +102,26 @@ private:
     PriceLadder bids_;
     PriceLadder asks_;
     std::unordered_map<uint64_t, OrderLocation> order_locations_;
+    OccupiedTicks bid_ticks_;
+    OccupiedTicks ask_ticks_;
     int32_t best_bid_tick_ = -1;
     int32_t best_ask_tick_ = -1;
+    uint64_t pool_exhausted_ = 0;
+
+    OccupiedTicks& occupied(char side) { return side == 'B' ? bid_ticks_ : ask_ticks_; }
 
     // Incoming buy at price_raw matches against resting asks at or below
     // price_raw, best (lowest) ask first, FIFO within each price level.
     void match_against_asks(uint64_t taker_ref, uint32_t price_raw, uint32_t& remaining,
                              std::vector<Fill>& out_fills) {
         while (remaining > 0 && best_ask_tick_ >= 0 &&
-               asks_.price_at_tick(best_ask_tick_) * 10000.0 <= static_cast<double>(price_raw) + 0.5) {
-            PriceLevel& level = asks_.level_at(best_ask_tick_);
+               asks_.raw_at_tick(best_ask_tick_) <= price_raw) {
+            const int32_t tick = best_ask_tick_;
+            PriceLevel& level = asks_.level_at(tick);
             fill_against_level(taker_ref, level, remaining, out_fills);
             if (level.order_count == 0) {
-                update_best_on_empty('S', best_ask_tick_);
+                ask_ticks_.clear(tick);
+                update_best_on_empty('S', tick);
             }
         }
     }
@@ -109,11 +131,13 @@ private:
     void match_against_bids(uint64_t taker_ref, uint32_t price_raw, uint32_t& remaining,
                              std::vector<Fill>& out_fills) {
         while (remaining > 0 && best_bid_tick_ >= 0 &&
-               bids_.price_at_tick(best_bid_tick_) * 10000.0 >= static_cast<double>(price_raw) - 0.5) {
-            PriceLevel& level = bids_.level_at(best_bid_tick_);
+               bids_.raw_at_tick(best_bid_tick_) >= price_raw) {
+            const int32_t tick = best_bid_tick_;
+            PriceLevel& level = bids_.level_at(tick);
             fill_against_level(taker_ref, level, remaining, out_fills);
             if (level.order_count == 0) {
-                update_best_on_empty('B', best_bid_tick_);
+                bid_ticks_.clear(tick);
+                update_best_on_empty('B', tick);
             }
         }
     }
@@ -147,7 +171,10 @@ private:
         int32_t tick = ladder.tick_index(price_raw);
 
         int32_t idx = pool_.alloc();
-        if (idx == kNullIndex) return; // pool exhausted; order silently dropped
+        if (idx == kNullIndex) {
+            ++pool_exhausted_;
+            return;
+        }
 
         Order& ord = pool_[idx];
         ord.order_ref_number = order_ref;
@@ -156,7 +183,9 @@ private:
         ord.shares = shares;
 
         PriceLevel& level = ladder.level_at(tick);
+        const bool was_empty = level.order_count == 0;
         append_to_level(level, idx);
+        if (was_empty) occupied(side).set(tick);
 
         order_locations_[order_ref] = {idx, tick, side};
         update_best_on_add(side, tick);
@@ -172,6 +201,7 @@ private:
             level.head = idx;
         }
         level.tail = idx;
+        level.total_shares += ord.shares;
         level.order_count++;
     }
 
@@ -197,14 +227,9 @@ private:
 
     void update_best_on_empty(char side, int32_t emptied_tick) {
         if (side == 'B' && emptied_tick == best_bid_tick_) {
-            int32_t t = emptied_tick - 1;
-            while (t >= 0 && bids_.level_at(t).order_count == 0) --t;
-            best_bid_tick_ = (t >= 0) ? t : -1;
+            best_bid_tick_ = bid_ticks_.next_below(emptied_tick);
         } else if (side == 'S' && emptied_tick == best_ask_tick_) {
-            size_t n = asks_.num_ticks();
-            int32_t t = emptied_tick + 1;
-            while (static_cast<size_t>(t) < n && asks_.level_at(t).order_count == 0) ++t;
-            best_ask_tick_ = (static_cast<size_t>(t) < n) ? t : -1;
+            best_ask_tick_ = ask_ticks_.next_above(emptied_tick);
         }
     }
 };

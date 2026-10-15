@@ -46,24 +46,21 @@ public:
 
     // Walks every 2-byte length-prefixed message in the file and dispatches
     // it via the given callbacks. Returns the number of messages processed.
+    // frame_stats() reports short and truncated frames from the last walk.
     size_t process_all(const ParserCallbacks& cb) const {
-        size_t offset = 0;
-        size_t count = 0;
-        while (offset + 2 <= size_) {
-            uint16_t msg_len = read_be16(data_ + offset);
-            offset += 2;
-            if (msg_len == 0 || offset + msg_len > size_) break;
-            dispatch_message(data_ + offset, msg_len, cb);
-            offset += msg_len;
-            ++count;
-        }
-        return count;
+        last_stats_ = FrameStats{};
+        return process_buffer(data_, size_, cb, &last_stats_);
     }
+
+    const FrameStats& frame_stats() const { return last_stats_; }
+    const uint8_t* data() const { return data_; }
+    size_t size() const { return size_; }
 
 private:
     int fd_ = -1;
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
+    mutable FrameStats last_stats_;
 };
 
 } // namespace itch

@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
     std::cout << "\n=== Summary ===\n";
     std::cout << "Total messages processed: " << count << "\n";
     std::cout << "Fully-typed (parsed into structs): " << typed_messages << "\n";
+    std::cout << "Frames: short=" << reader.frame_stats().short_frames
+              << " truncated_tail=" << reader.frame_stats().truncated_tail << "\n";
     std::cout << "Elapsed time: " << seconds << " s\n";
     std::cout << std::fixed << std::setprecision(0);
     std::cout << "Throughput: " << msgs_per_sec << " messages/sec\n";

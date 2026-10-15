@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>quantSys study viewer</title>
+<style>
+  body { font-family: Georgia, serif; margin: 2rem auto; max-width: 960px; color: #1c1c1c; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+  .limit { background: #f4f1ea; padding: 0.8rem 1rem; }
+  label { display: block; margin: 0.6rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: right; padding: 0.25rem 0.5rem; border-bottom: 1px solid #ddd; }
+  th:first-child, td:first-child { text-align: left; }
+  .bar { height: 0.7rem; background: #3d5a40; }
+  .empty { color: #555; }
+  pre { background: #f6f6f6; padding: 0.6rem; overflow: auto; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>Historical study</h1>
+<p class="limit" id="limit">A row is not a fill. Queue position in the decile table is not modeled. The fill-model page is a tape reconstruction, not a live order. A positive number is not permission to send orders.</p>
+<label>Imbalance CSV <input id="imbalance-file" type="file" accept=".csv"></label>
+<label>Decisions CSV <input id="decisions-file" type="file" accept=".csv"></label>
+<label>By-day evaluator CSV <input id="byday-file" type="file" accept=".csv"></label>
+<label>Features CSV <input id="features-file" type="file" accept=".csv"></label>
+<label>Run record (.manifest.json) <input id="manifest-file" type="file" accept=".json,.manifest.json"></label>
+<p class="empty" id="empty">Choose study files from disk. Nothing is loaded from the network.</p>
+<section id="report" hidden>
+  <h2>Regular-hours spread</h2>
+  <p id="spread-summary"></p>
+  <div id="spread-bars"></div>
+  <h2>Imbalance deciles</h2>
+  <table id="deciles"></table>
+  <h2>Hypothetical decisions</h2>
+  <p id="decision-summary"></p>
+  <table id="decisions"></table>
+  <h2>Held-out days</h2>
+  <p id="byday-summary"></p>
+  <table id="byday"></table>
+  <h2>Passive fills by queue ahead</h2>
+  <p id="fill-summary"></p>
+  <table id="fills"></table>
+  <h2>Markouts of filled passive orders</h2>
+  <p id="markout-summary"></p>
+  <table id="markouts"></table>
+  <h2>Run record</h2>
+  <pre id="manifest"></pre>
+</section>
+<script>
+const OPEN_NS = 34200000000000;
+const CLOSE_NS = 57600000000000;
+
+function parseCsv(text) {
+  const lines = (text || "").split(/\r?\n/).filter((line) => line.length > 0);
+  if (lines.length === 0) return [];
+  const header = lines[0].split(",");
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(",");
+    if (cells.length < header.length) {
+      while (cells.length < header.length) cells.push("");
+    }
+    const row = {};
+    for (let c = 0; c < header.length; c++) {
+      const key = header[c];
+      const raw = cells[c];
+      if (key === "side" || key === "day" || key.endsWith("_kind")) row[key] = raw;
+      else if (raw === "" || raw === undefined) row[key] = NaN;
+      else row[key] = Number(raw);
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function median(values) {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function fmt(value, digits) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "";
+}
+
+function decileRows(samples) {
+  const paired = samples.filter((row) => Number.isFinite(row.mid_change));
+  paired.sort((a, b) => a.imbalance - b.imbalance);
+  const n = paired.length;
+  const rows = [];
+  for (let bucket = 0; bucket < 10; bucket++) {
+    const begin = Math.floor((bucket * n) / 10);
+    const end = Math.floor(((bucket + 1) * n) / 10);
+    let change = 0;
+    let after = 0;
+    for (let i = begin; i < end; i++) {
+      change += paired[i].mid_change;
+      after += paired[i].change_after_cost;
+    }
+    const count = end - begin;
+    rows.push({
+      bucket,
+      count,
+      mean_change: count ? change / count : 0,
+      after: count ? after / count : 0,
+    });
+  }
+  return rows;
+}
+
+function queueBucket(ahead) {
+  if (!Number.isFinite(ahead) || ahead < 0) return "none";
+  if (ahead < 100) return "0-99";
+  if (ahead < 500) return "100-499";
+  if (ahead < 2000) return "500-1999";
+  return "2000+";
+}
+
+function filledKind(kind) { return kind === "Q" || kind === "T"; }
+
+function renderReport(imbalanceText, decisionsText, byDayText, featuresText, manifestText) {
+  const empty = document.getElementById("empty");
+  const report = document.getElementById("report");
+  const samples = parseCsv(imbalanceText || "");
+  const decisions = parseCsv(decisionsText || "");
+  const byDay = parseCsv(byDayText || "");
+  const features = parseCsv(featuresText || "");
+  let manifest = null;
+  if (manifestText && manifestText.trim()) {
+    try { manifest = JSON.parse(manifestText); } catch (err) { manifest = { error: "invalid JSON" }; }
+  }
+  const hasAnything = samples.length + decisions.length + byDay.length + features.length > 0 || manifest;
+  if (!hasAnything) {
+    report.hidden = true;
+    empty.hidden = false;
+    empty.textContent = "No rows. Choose a study CSV, or the file had only a header.";
+    return { samples: 0, decisions: 0, byDay: 0, features: 0, deciles: [] };
+  }
+  empty.hidden = true;
+  report.hidden = false;
+
+  const regular = samples.filter((row) => row.timestamp_ns >= OPEN_NS && row.timestamp_ns < CLOSE_NS);
+  const spreads = regular.map((row) => row.spread);
+  const oneTick = spreads.filter((spread) => Math.abs(spread - 0.01) <= 1e-6).length;
+  document.getElementById("spread-summary").textContent = samples.length === 0
+    ? "No imbalance CSV loaded."
+    : regular.length === 0
+      ? "No regular-hours samples."
+      : "Regular hours: " + regular.length +
+        ". Median spread " + median(spreads).toFixed(4) +
+        ". One-cent fraction " + (oneTick / regular.length).toFixed(4) + ".";
+
+  const bars = document.getElementById("spread-bars");
+  bars.replaceChildren();
+  if (spreads.length) {
+    const buckets = [0.01, 0.02, 0.03, 0.04];
+    const counts = buckets.map((cent) => spreads.filter((spread) => Math.abs(spread - cent) <= 1e-6).length);
+    const wider = spreads.length - counts.reduce((sum, count) => sum + count, 0);
+    const maxCount = Math.max(1, ...counts, wider);
+    buckets.concat([null]).forEach((cent, index) => {
+      const count = cent == null ? wider : counts[index];
+      const label = document.createElement("div");
+      label.textContent = (cent == null ? "wider" : cent.toFixed(2)) + "  " + count;
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.style.width = (100 * count / maxCount) + "%";
+      bars.appendChild(label);
+      bars.appendChild(bar);
+    });
+  }
+
+  const deciles = decileRows(samples);
+  const decileTable = document.getElementById("deciles");
+  decileTable.innerHTML = "<tr><th>Bucket</th><th>n</th><th>Mean mid change</th><th>After half-spread</th></tr>";
+  for (const row of deciles) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + row.bucket + "</td><td>" + row.count + "</td><td>" +
+      row.mean_change.toFixed(6) + "</td><td>" + row.after.toFixed(6) + "</td>";
+    decileTable.appendChild(tr);
+  }
+
+  const decisionSummary = document.getElementById("decision-summary");
+  if (decisions.length === 0) {
+    decisionSummary.textContent = "No hypothetical decisions.";
+  } else {
+    const first = decisions[0];
+    decisionSummary.textContent = decisions.length +
+      " hypothetical decisions. Drops: price_out_of_band=" + first.price_out_of_band +
+      " pool_exhausted=" + first.pool_exhausted +
+      " unknown_order=" + first.unknown_order +
+      " duplicate_order=" + (Number.isFinite(first.duplicate_order) ? first.duplicate_order : 0) +
+      ". These rows are not fills.";
+  }
+  const decisionTable = document.getElementById("decisions");
+  decisionTable.innerHTML = "<tr><th>Side</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Imbalance</th><th>Forward mid</th><th>Half-spread</th></tr>";
+  for (const row of decisions.slice(0, 20)) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + row.side + "</td><td>" + row.bid + "</td><td>" + row.ask +
+      "</td><td>" + row.spread + "</td><td>" + fmt(row.imbalance, 4) +
+      "</td><td>" + row.forward_mid + "</td><td>" + row.half_spread + "</td>";
+    decisionTable.appendChild(tr);
+  }
+
+  const bydaySummary = document.getElementById("byday-summary");
+  const bydayTable = document.getElementById("byday");
+  if (byDay.length === 0) {
+    bydaySummary.textContent = "No by-day evaluator CSV loaded.";
+    bydayTable.innerHTML = "";
+  } else {
+    const ridge = byDay.map((row) => row.ridge_mean_after_cost).filter(Number.isFinite);
+    const mean = ridge.length ? ridge.reduce((a, b) => a + b, 0) / ridge.length : 0;
+    const perSample = byDay.map((row) => row.ridge_mean_per_sample).filter(Number.isFinite);
+    const perMean = perSample.length ? perSample.reduce((a, b) => a + b, 0) / perSample.length : NaN;
+    bydaySummary.textContent = byDay.length + " held-out rows. Mean ridge after cost (per trade) " +
+      mean.toFixed(6) +
+      (Number.isFinite(perMean) ? ". Per sample " + perMean.toFixed(6) : "") +
+      ". Thinned corr uses one sample per horizon. Baselines are imbalance-only, train-only deciles, and no-trade (0). " +
+      "A positive mean is not permission to send orders.";
+    bydayTable.innerHTML = "<tr><th>Day</th><th>Horizon s</th><th>n</th><th>Corr</th><th>Thinned corr</th><th>Ridge after cost</th><th>Per sample</th><th>One-tick after cost</th><th>Imbalance after cost</th><th>Decile after cost</th><th>Passive fill rate</th></tr>";
+    for (const row of byDay) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + row.day + "</td><td>" + row.horizon_s + "</td><td>" + row.n +
+        "</td><td>" + fmt(row.corr, 4) + "</td><td>" + fmt(row.corr_thinned, 4) +
+        "</td><td>" + fmt(row.ridge_mean_after_cost, 6) +
+        "</td><td>" + fmt(row.ridge_mean_per_sample, 6) +
+        "</td><td>" + fmt(row.one_tick_mean_after_cost, 6) +
+        "</td><td>" + fmt(row.imbalance_mean_after_cost, 6) +
+        "</td><td>" + fmt(row.decile_mean_after_cost, 6) +
+        "</td><td>" + fmt(row.passive_fill_rate, 4) + "</td>";
+      bydayTable.appendChild(tr);
+    }
+  }
+
+  const fillSummary = document.getElementById("fill-summary");
+  const fillTable = document.getElementById("fills");
+  const markSummary = document.getElementById("markout-summary");
+  const markTable = document.getElementById("markouts");
+  if (features.length === 0) {
+    fillSummary.textContent = "No features CSV loaded.";
+    fillTable.innerHTML = "";
+    markSummary.textContent = "";
+    markTable.innerHTML = "";
+  } else {
+    const orders = [];
+    for (const row of features) {
+      for (const side of ["bid", "ask"]) {
+        const kind = row[side + "_kind"];
+        if (!kind) continue;
+        orders.push({
+          side,
+          kind,
+          ahead: row[side + "_queue_ahead"],
+          m1: row[side + "_markout_1s"],
+          m5: row[side + "_markout_5s"],
+          m30: row[side + "_markout_30s"],
+          filled: filledKind(kind),
+        });
+      }
+    }
+    const bucketOrder = ["0-99", "100-499", "500-1999", "2000+"];
+    const buckets = {};
+    for (const order of orders) {
+      const name = queueBucket(order.ahead);
+      if (!buckets[name]) buckets[name] = { placed: 0, filled: 0 };
+      buckets[name].placed += 1;
+      if (order.filled) buckets[name].filled += 1;
+    }
+    fillSummary.textContent = orders.length + " hypothetical passive orders. Fill rate is tape-reconstructed. Hidden liquidity is not modeled.";
+    fillTable.innerHTML = "<tr><th>Queue ahead</th><th>Placed</th><th>Filled</th><th>Fill rate</th></tr>";
+    for (const name of bucketOrder) {
+      const b = buckets[name];
+      if (!b) continue;
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + name + "</td><td>" + b.placed + "</td><td>" + b.filled +
+        "</td><td>" + (b.placed ? (b.filled / b.placed).toFixed(4) : "") + "</td>";
+      fillTable.appendChild(tr);
+    }
+    const filled = orders.filter((o) => o.filled);
+    const avg = (key) => {
+      const xs = filled.map((o) => o[key]).filter(Number.isFinite);
+      return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN;
+    };
+    markSummary.textContent = filled.length +
+      " filled orders. Markout is signed mid minus fill (bid) or fill minus mid (ask). Rebate is not included.";
+    markTable.innerHTML = "<tr><th>Horizon</th><th>Mean markout</th></tr>";
+    [["1s", avg("m1")], ["5s", avg("m5")], ["30s", avg("m30")]].forEach(([name, value]) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + name + "</td><td>" + fmt(value, 6) + "</td>";
+      markTable.appendChild(tr);
+    });
+  }
+
+  const manifestEl = document.getElementById("manifest");
+  if (!manifest) {
+    manifestEl.textContent = "No run record loaded.";
+  } else {
+    const drops = manifest.counts || {};
+    manifestEl.textContent =
+      "tool: " + (manifest.tool || "") + "\n" +
+      "git_commit: " + (manifest.git_commit || "") +
+      (manifest.git_dirty ? " (dirty)" : "") + "\n" +
+      "created_utc: " + (manifest.created_utc || "") + "\n" +
+      "inputs: " + JSON.stringify(manifest.inputs || [], null, 2) + "\n" +
+      "params: " + JSON.stringify(manifest.params || {}, null, 2) + "\n" +
+      "drops: price_out_of_band=" + (drops.price_out_of_band || 0) +
+      " pool_exhausted=" + (drops.pool_exhausted || 0) +
+      " unknown_order=" + (drops.unknown_order || 0) +
+      " duplicate_order=" + (drops.duplicate_order || 0) + "\n" +
+      "counts: " + JSON.stringify(drops, null, 2);
+  }
+
+  return {
+    samples: samples.length,
+    decisions: decisions.length,
+    byDay: byDay.length,
+    features: features.length,
+    deciles,
+  };
+}
+
+function loadChosen() {
+  const read = (id) => {
+    const file = document.getElementById(id).files[0];
+    return file ? file.text() : Promise.resolve("");
+  };
+  Promise.all([
+    read("imbalance-file"),
+    read("decisions-file"),
+    read("byday-file"),
+    read("features-file"),
+    read("manifest-file"),
+  ]).then((texts) => renderReport(...texts));
+}
+
+["imbalance-file", "decisions-file", "byday-file", "features-file", "manifest-file"]
+  .forEach((id) => document.getElementById(id).addEventListener("change", loadChosen));
+
+window.renderAll = renderReport;
+window.renderReport = function (imbalanceText, decisionsText) {
+  return window.renderAll(imbalanceText, decisionsText, "", "", "");
+};
+</script>
+</body>
+</html>

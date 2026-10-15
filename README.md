@@ -14,7 +14,7 @@ the gap between this and anything that could safely touch real markets.
 
 ## Architecture
 
-Three phases, each building on the last:
+Phases, each building on the last:
 
 1. **Lock-free SPSC ring buffer** (`include/spsc_ring_buffer*.hpp`) --
    cache-line-padded, acquire/release vs. seq_cst memory ordering compared
@@ -180,6 +180,29 @@ I/O, page faults, or other causes. p50/p90/p99/p99.9 are the
 trustworthy, reproducible numbers; `max` on this platform is not.
 
 
+## Where the time actually goes
+
+A native `-march=native` run of `bench_matching_engine` (2,000,000
+orders, same seed) is about 89 ns at p50. Splitting that workload
+showed two different costs:
+
+- On a tight book the median is the hash-map update. Replacing it with
+  an open-addressed table sized to the full pool cap made p50 worse
+  (about 90 ns to about 220 ns): the table was hundreds of megabytes
+  and no longer fit in cache. That change was reverted. `OrderBook`
+  now reserves its map at construction, which is the same rehash fix
+  the matcher already had.
+- On a gapped book, walking every empty cent to find the next bid or
+ask was the tail. `./build-native/bench_gap_scan` is that workload
+(400,000 orders, 10-cent grid). Before the bitset its p99 was about
+1,980 ns; after `occupied_ticks.hpp`, a native run reported about 340 ns. The dense official bench moved less, because
+  that book rarely has a wide hole: p90 179 ns to 148 ns, p99 418 ns
+to 376 ns. p50 stayed 89 ns. Cross checks now compare integer tick
+prices, so a double rounding step is not part of the match decision.
+
+`max` is still WSL2 scheduler noise. Do not tune for it. `perf` is not
+installed in this WSL distro; the numbers above are `rdtscp` percentiles.
+
 ## Phase 4: Pre-trade risk layer
 
 `include/book/risk_engine.hpp` + `include/book/risk_gated_engine.hpp`.
@@ -313,24 +336,178 @@ measured number here is the point: an easy, flattering result is not
 automatically the correct one, and the only way to know the difference
 is to test the workload that actually matters, not the one that is
 easiest to isolate.
+
+## Phase 6: Sharded full-market replay
+
+`include/book/sharded_replay.hpp`. One parser thread walks the tape in
+order and pushes each book event onto a Phase-1 SPSC ring chosen by
+`stock_locate % N`. Each worker thread owns that shard's
+`LocateIndexedBook`. Locates never share a book, so there is no lock on
+the hot path — only lock-free hand-off and `_mm_pause` when a ring is
+full.
+
+`--shards 1` is the default (parser plus one worker). `--shards 8` is
+the 24-core host using a third of the cores. Applied counts and drop
+counts must match the single-thread book; `test_sharded_replay` checks
+1/2/4 shards against a sequential replay of the same synthetic tape.
+This is still historical reconstruction. It does not send an order.
+
 ## Building and running
 
-    mkdir -p build && cd build
-    cmake ..
-    make
+Linux or WSL (Ubuntu 22.04), from the repo root. Test binaries keep
+`assert` enabled. Release replay and bench binaries define `NDEBUG`.
 
-    ./test_order_pool          # pool allocator correctness
-    ./test_order_book          # order book correctness (12 assertions)
-    ./test_matching_engine     # matching engine correctness (FIFO, sweeps, cancels)
-    ./test_itch_parser         # ITCH byte-level round-trip correctness
+```bash
+bash scripts/ci.sh
+```
 
-    ./bench_ring_buffer                           # Phase 1 latency comparison
-    ./replay_itch <path-to-itch-file>              # Phase 2 throughput + histogram
-    ./replay_symbol <path-to-itch-file> <TICKER>   # Phase 3a real book reconstruction
-    ./bench_matching_engine                        # Phase 3b latency benchmark
+Same steps without Docker: `QUANT_CI_SKIP_DOCKER=1 bash scripts/ci.sh`, or
+the CMake lines that script runs (`-DQUANT_SANITIZE=ON`, then `ctest`).
+
+| CMake option | Default | Effect |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | `Release` | `-O3` |
+| `QUANT_NATIVE_ARCH` | `OFF` | `ON` adds `-march=native` for WSL latency benches. Leave off for a portable build (`-march=x86-64-v3`). |
+| `QUANT_SANITIZE` | `OFF` | AddressSanitizer and UndefinedBehaviorSanitizer. |
+
+```bash
+./build/replay_itch <path-to-itch-file>
+./build/replay_symbol <path-to-itch-file> <TICKER>
+./build/replay_full_market <path-to-itch-file>
+./build/bench_ring_buffer
+./build/bench_matching_engine
+```
+
+Full-market replay prints `price_out_of_band`, `pool_exhausted`, and
+`unknown_order` drop counts. A run that drops events did not reconstruct
+a complete book.
+
+Docker runs the same tests in a non-root image. It does not copy market
+data into the image. Put ITCH files in `data/` (gitignored) and mount
+that directory:
+
+```bash
+docker build -t quantsys:local .
+docker run --rm quantsys:local
+
+docker compose build
+docker compose run --rm quantsys
+docker compose run --rm --entrypoint /src/build/research_imbalance quantsys \
+  /data/your-itch-file AAPL /data/AAPL_imbalance.csv
+```
 
 Real ITCH sample data: https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/ --
 free, several GB per trading day, standard 2-byte length-prefixed framing.
+Do not commit those files.
+
+## Imbalance study
+
+`research_imbalance` replays one ticker through a single book with a large
+order pool (the full-market cap of 5,000 orders per symbol truncates liquid
+names). Every 100ms of ITCH time, if the book is two-sided, it records mid,
+spread, top-of-book imbalance `(bidSize - askSize) / (bidSize + askSize)`,
+and microprice. The forward mid is the first later sample at least one
+second ahead. The cost haircut is `max(spread, 0) / 2`.
+
+```bash
+./build/research_imbalance <path-to-itch-file> AAPL
+```
+
+That writes `data/<date>/AAPL_imbalance.csv`, `AAPL_decisions.csv`, and
+`AAPL_features.csv`, each with a `.manifest.json` run record (git commit,
+input size and FNV-1a hash, parameters, drop counts). Short and truncated
+ITCH frames are counted and not parsed.
+
+The printed report includes regular-hours median spread, the one-cent
+fraction, next-level gaps, drop counts, imbalance deciles after a
+half-spread haircut, and a walk-forward least-squares baseline. Half the
+spread is a lower bound, not a fill. Queue position and adverse selection
+are not in that table.
+
+`--maker-rebate` and `--taker-fee` are per-share parameters, default 0,
+recorded in the run record. They are not Nasdaq's schedule.
+
+### Fill model and features
+
+On each regular-hours one-cent sample the study places a hypothetical
+100-share bid at the touch and a 100-share ask at the touch. Queue ahead
+starts as displayed size at that tick. Executions and cancels of orders
+that arrived earlier reduce it. The order fills when later volume at that
+price covers 100 shares, or when the opposite touch reaches its price
+(trade-through). It is pulled after 10 seconds or a move of more than one
+tick. Markouts at +1s, +5s, and +30s are signed mid minus fill (bid) or
+fill minus mid (ask).
+
+Not modeled, and printed every run: hidden liquidity (`P` trades never
+touch the displayed queue), the order's own effect on other traders, and
+latency.
+
+Features written per sample, using only events at or before that time:
+top imbalance, microprice minus mid, spread, 1s order-flow imbalance
+(Cont, Kukanov, Stoikov 2014), 5-tick depth imbalance, 1s signed trade
+volume, 1s mid change, minutes since the open. Targets are forward mid
+changes at 1s, 5s, and 30s.
+
+### Held-out-day evaluator
+
+`research_evaluate` takes a list of features CSVs. Per ticker and horizon
+it holds out one day, standardizes and fits ridge on the others (lambda
+from an inner hold-out of training days), and scores:
+
+- cross the spread when `|pred|` exceeds half-spread plus taker fee
+- rest passively on the predicted side, taking the fill-model outcome
+
+Baselines: no trade, imbalance-only, and the outer-decile rule with
+thresholds from training days only (the older whole-day decile cut is
+look-ahead). Output is `data/eval/<TICKER>_by_day.csv` plus a printed
+mean across days with a seeded bootstrap 95% interval. A positive mean
+after cost is not permission to send orders.
+
+On the ten default days and five names, leave-one-day-out ridge **mean
+after cost is negative** for every ticker and horizon. Seeded bootstrap
+95% intervals sit entirely below zero for AAPL and MSFT at 1s/5s/30s, for
+AMD at 1s/5s, for INTC at 5s, and for QQQ at 1s. The remaining intervals
+(AMD 30s, INTC 1s/30s, QQQ 5s/30s) include zero. Imbalance-only is
+usually no trades (`|pred|` below half-spread). Train-only outer-decile
+and passive fill-model markouts are more negative. One-symbol studies
+report `pool_exhausted=0` and `Frames: short=0`; they do not raise the
+full-market pool cap. Half-spread is a lower bound, not a fill. Queue
+position is not a ridge feature. Hidden liquidity, own size, latency, and
+Nasdaq's fee schedule are not modeled. This is not a tradable edge.
+
+The evaluator also reports (1) correlation on samples at least one horizon
+apart, because 100 ms rows share the same second of mid; (2) mean after
+cost per sample, counting no-trade rows as zero; (3) the same cross rule
+restricted to one-cent spreads; (4) leave-one-feature-out after-cost
+means; (5) mean standardized ridge weights. Overlapping-sample
+correlation is not evidence of a forecast.
+
+### Scripts
+
+```bash
+bash scripts/ci.sh                          # sanitized build, ctest, docker
+ITCH_DIR=/home/ael/itch scripts/fetch_itch_day.sh 12302019
+scripts/check_golden.sh 12302019 /home/ael/itch   # count-only replay check
+ITCH_DIR=/home/ael/itch scripts/run_study.sh      # 10 days x 5 names
+```
+
+`fetch_itch_day.sh` retries, checks free disk, skips days already present,
+and refuses ITCH v2 `S0*` files. Default `ITCH_DIR` is `/tmp/itch`; WSL
+wipes `/tmp` on reboot, so use a persistent path. CSVs stay under `data/`
+(gitignored). Default days: 01302019 03272019 07302019 08302019 10182019
+10302019 12302019 01302020 07132021 08132021. Default tickers: AAPL MSFT
+AMD INTC QQQ.
+
+Full-market replay sizes each locate's pool from a pass-1 peak of adds
+minus deletes, capped by `--memory-budget-mb` (default 4096). Locates the
+budget cuts are named. `--fixed-cap N` restores the old uniform cap.
+
+### Viewer
+
+Open `viewer/index.html` (locally, or a directory server) and choose from
+disk: imbalance CSV, decisions CSV, by-day evaluator CSV, features CSV,
+and a `.manifest.json`. The page does not fetch anything. Empty and
+header-only files show the empty state.
 
 ## What this is not
 
@@ -354,7 +531,9 @@ closes it:
   configuration itself as sensitive, audited, and change-controlled --
   none of that process exists here, only the mechanism.
 - No order gateway / FIX engine. There is no code here that could send
-  a real order to a real exchange or broker.
+  a real order to a real exchange or broker. `research_imbalance` is a
+  historical hypothesis report. It does not become a strategy because a
+  decile is positive.
 - Single symbol, single thread, bounded price range. Deliberate scope
   choices for this project, not production constraints solved.
 - "Fast" is relative and WSL2-measured. All latency numbers were taken

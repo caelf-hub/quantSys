@@ -1,0 +1,23 @@
+---
+description: C++ hot-path rules for the ITCH book and parser
+globs: "**/*.{hpp,cpp}"
+alwaysApply: false
+---
+
+# C++ quant hot path
+
+- RAII owns every fd, mapping, and buffer. No bare `new` / `delete`.
+- After an order book or pool is constructed, the hot path must not allocate.
+- Index handles stay valid only while the pool does not reallocate. Do not grow a pool on the hot path.
+- Bounds-check every ITCH offset and price-ladder index. Reject with a drop counter, do not clamp into a wrong level.
+- New behavior: add a failing assert test first, then the code. Test targets build with `-Werror` and without `NDEBUG`.
+- Sanitizer-clean (`-DQUANT_SANITIZE=ON`) before calling a book change done.
+- Do not rewrite a hot structure without a before/after number from an existing `src/bench_*.cpp`.
+
+```cpp
+// BAD: second order at an occupied level never linked, and the miss is ignored.
+if (level.order_count == 0) level.head = idx;
+
+// GOOD: link at the tail, and record why an add did not rest.
+if (tick < 0) { ++drops_.price_out_of_band; return false; }
+```

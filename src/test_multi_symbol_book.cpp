@@ -45,6 +45,14 @@ int main() {
     assert(market.resting_order_count("PRICEY") == 2);
     std::cout << "[PASS] symbols remain isolated under dynamic per-symbol bands\n";
 
+    // band_max < band_min (zero first price) or uint32 overflow must not wrap
+    // the unsigned ladder size.
+    assert(!market.add_order("ZERO", 5, 'B', 0, 100));
+    assert(market.ladder_ticks("ZERO") <= 2);
+    assert(market.add_order("HUGE", 6, 'S', UINT32_MAX - 100, 100));
+    assert(market.ladder_ticks("HUGE") > 1 && market.ladder_ticks("HUGE") <= 200001);
+    std::cout << "[PASS] degenerate first prices build bounded ladders\n";
+
     std::cout << "All MultiSymbolBook tests passed.\n";
     return 0;
 }

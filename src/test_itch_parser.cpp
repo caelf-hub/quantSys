@@ -157,6 +157,24 @@ static std::vector<uint8_t> build_system_event(uint16_t stock_locate, uint16_t t
     return m;
 }
 
+static std::vector<uint8_t> build_trade(uint16_t stock_locate, uint16_t tracking,
+                                         uint64_t timestamp_ns, uint64_t order_ref, char side,
+                                         uint32_t shares, const char* stock8,
+                                         uint32_t price_raw, uint64_t match_number) {
+    std::vector<uint8_t> m;
+    m.push_back('P');
+    write_be16(m, stock_locate);
+    write_be16(m, tracking);
+    write_be48(m, timestamp_ns);
+    write_be64(m, order_ref);
+    m.push_back(static_cast<uint8_t>(side));
+    write_be32(m, shares);
+    for (int i = 0; i < 8; ++i) m.push_back(static_cast<uint8_t>(stock8[i]));
+    write_be32(m, price_raw);
+    write_be64(m, match_number);
+    return m;
+}
+
 static void write_framed(std::ofstream& out, const std::vector<uint8_t>& msg) {
     std::vector<uint8_t> len_prefix;
     write_be16(len_prefix, static_cast<uint16_t>(msg.size()));
@@ -274,5 +292,95 @@ int main() {
     assert(seen == 8);
 
     std::cout << "All " << count << " ITCH message types parsed and verified correctly.\n";
+
+    // A frame shorter than its message type must not be parsed. Without the
+    // check, parse_add_order reads 36 bytes out of a 20-byte frame.
+    {
+        std::vector<uint8_t> buf;
+        auto append = [&](const std::vector<uint8_t>& msg, uint16_t declared) {
+            write_be16(buf, declared);
+            buf.insert(buf.end(), msg.begin(), msg.begin() + declared);
+        };
+        append(build_add_order(42, 1, 1, 1, 'B', 100, "AAPL    ", 1500000), 36);
+        append(build_add_order(42, 2, 2, 2, 'B', 100, "AAPL    ", 1500000), 20);
+        append(build_order_delete(42, 3, 3, 1), 19);
+
+        int adds = 0;
+        int deletes = 0;
+        ParserCallbacks short_cb;
+        short_cb.on_add_order = [&](const AddOrder&) { ++adds; };
+        short_cb.on_order_delete = [&](const OrderDelete&) { ++deletes; };
+        FrameStats stats;
+        const size_t framed = process_buffer(buf.data(), buf.size(), short_cb, &stats);
+        assert(framed == 3);
+        assert(adds == 1);
+        assert(deletes == 1);
+        assert(stats.short_frames == 1);
+        std::cout << "[PASS] short frame is counted and not parsed\n";
+    }
+
+    // A frame longer than its type is allowed; the extra bytes are skipped.
+    {
+        std::vector<uint8_t> buf;
+        auto del = build_order_delete(42, 4, 4, 7);
+        del.push_back(0xAB);
+        write_be16(buf, static_cast<uint16_t>(del.size()));
+        buf.insert(buf.end(), del.begin(), del.end());
+        uint64_t seen_ref = 0;
+        ParserCallbacks long_cb;
+        long_cb.on_order_delete = [&](const OrderDelete& m) { seen_ref = m.order_ref_number; };
+        FrameStats stats;
+        assert(process_buffer(buf.data(), buf.size(), long_cb, &stats) == 1);
+        assert(seen_ref == 7);
+        assert(stats.short_frames == 0);
+        std::cout << "[PASS] longer frame parses its known prefix\n";
+    }
+
+    // A trailing frame whose length runs past the buffer stops the walk.
+    {
+        std::vector<uint8_t> buf;
+        auto del = build_order_delete(42, 5, 5, 8);
+        write_be16(buf, 19);
+        buf.insert(buf.end(), del.begin(), del.end());
+        write_be16(buf, 36);
+        buf.push_back('A');
+        FrameStats stats;
+        ParserCallbacks none;
+        assert(process_buffer(buf.data(), buf.size(), none, &stats) == 1);
+        assert(stats.truncated_tail == 1);
+        std::cout << "[PASS] truncated trailing frame is counted and stops the walk\n";
+    }
+
+    // 'P' non-cross trade: 44 bytes, hidden or non-displayed liquidity.
+    {
+        const auto trade = build_trade(42, 9, 100000000800ULL, 0, 'S', 250, "AAPL    ",
+                                       2900500, 777);
+        assert(trade.size() == 44);
+        assert(message_length('P') == 44);
+        std::vector<uint8_t> buf;
+        write_be16(buf, 44);
+        buf.insert(buf.end(), trade.begin(), trade.end());
+        write_be16(buf, 30);
+        buf.insert(buf.end(), trade.begin(), trade.begin() + 30);
+
+        int trades = 0;
+        ParserCallbacks trade_cb;
+        trade_cb.on_trade = [&](const Trade& m) {
+            ++trades;
+            assert(m.header.stock_locate == 42 && m.header.tracking_number == 9);
+            assert(m.header.timestamp_ns == 100000000800ULL);
+            assert(m.order_ref_number == 0);
+            assert(m.buy_sell_indicator == 'S');
+            assert(m.shares == 250);
+            assert(std::memcmp(m.stock.data(), "AAPL    ", 8) == 0);
+            assert(m.price_raw == 2900500);
+            assert(m.match_number == 777);
+        };
+        FrameStats stats;
+        assert(process_buffer(buf.data(), buf.size(), trade_cb, &stats) == 2);
+        assert(trades == 1);
+        assert(stats.short_frames == 1);
+        std::cout << "[PASS] Trade (P) parses; a short P frame is counted\n";
+    }
     return 0;
 }

@@ -72,6 +72,11 @@ public:
 
     size_t symbol_count() const { return books_.size(); }
 
+    size_t ladder_ticks(const std::string& symbol) const {
+        auto it = books_.find(symbol);
+        return it == books_.end() ? 0 : it->second.ladder_ticks();
+    }
+
     const std::unordered_map<std::string, OrderBook>& all_books() const { return books_; }
 
 private:
@@ -96,7 +101,8 @@ private:
 
         uint32_t band_min = (first_price_raw > half) ? (first_price_raw - half) : tick_size_;
         uint32_t band_max = first_price_raw + half;
-        if (band_max < first_price_raw) band_max = first_price_raw + kMaxHalfWidthRaw; // overflow guard
+        if (band_max < first_price_raw) band_max = UINT32_MAX; // overflow guard
+        if (band_max < band_min) band_max = band_min;
 
         auto result = books_.emplace(
             symbol, OrderBook(band_min, band_max, tick_size_, max_orders_per_symbol_));

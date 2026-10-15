@@ -1,0 +1,8 @@
+services:
+  quantsys:
+    build: .
+    image: quantsys:local
+    user: "10001:10001"
+    working_dir: /src
+    volumes:
+      - ./data:/data

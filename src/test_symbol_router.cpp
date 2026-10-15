@@ -39,10 +39,11 @@ int main() {
     std::cout << "[PASS] fill on one symbol does not affect another symbol's book\n";
 
     // --- Test 3: risk state (position) is independent per symbol ---
-    router.submit_order("AAPL", 4, 'B', px(150.00), 200); // AAPL net position now +200
-    router.submit_order("MSFT", 5, 'B', px(300.00), 10);  // MSFT net position now +10
+    router.submit_order("AAPL", 4, 'B', px(150.00), 200); // AAPL flat, then long 200
+    // MSFT is still short 50 from the resting sell. Buying 10 covers part of it.
+    router.submit_order("MSFT", 5, 'B', px(300.00), 10);
     assert(router.risk_for("AAPL").net_position() == 200);
-    assert(router.risk_for("MSFT").net_position() == 10);
+    assert(router.risk_for("MSFT").net_position() == -40);
     std::cout << "[PASS] net position tracked independently per symbol\n";
 
     // --- Test 4: kill switch on one symbol doesn't affect another ---

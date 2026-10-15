@@ -63,11 +63,9 @@ public:
             return {false, RiskRejectReason::OrderSizeExceedsMax};
         }
 
-        uint64_t order_value_raw = static_cast<uint64_t>(price_raw) * static_cast<uint64_t>(shares);
-        if (order_value_raw > config_.max_order_value_raw) {
-            return {false, RiskRejectReason::OrderValueExceedsMax};
-        }
-
+        // Collar before notional. A stub quote is a price error even when
+        // the notional would also exceed the value cap, and the tests lock
+        // that reason in for the $199,999.99 case.
         if (reference_price_raw > 0) {
             double ref = static_cast<double>(reference_price_raw);
             double px = static_cast<double>(price_raw);
@@ -75,6 +73,11 @@ public:
             if (pct_away > config_.price_collar_pct) {
                 return {false, RiskRejectReason::PriceOutsideCollar};
             }
+        }
+
+        uint64_t order_value_raw = static_cast<uint64_t>(price_raw) * static_cast<uint64_t>(shares);
+        if (order_value_raw > config_.max_order_value_raw) {
+            return {false, RiskRejectReason::OrderValueExceedsMax};
         }
 
         int64_t signed_shares = (side == 'B') ? static_cast<int64_t>(shares)

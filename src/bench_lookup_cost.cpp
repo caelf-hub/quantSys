@@ -45,8 +45,8 @@ int main(int argc, char** argv) {
     {
         volatile uint64_t sink = 0;
         ParserCallbacks cb;
-        cb.on_add_order = [&](const AddOrder& m) { sink += m.shares; };
-        cb.on_add_order_mpid = [&](const AddOrderMPID& m) { sink += m.shares; };
+        cb.on_add_order = [&](const AddOrder& m) { sink = sink + m.shares; };
+        cb.on_add_order_mpid = [&](const AddOrderMPID& m) { sink = sink + m.shares; };
 
         double t0 = now_seconds();
         size_t total = reader.process_all(cb);
@@ -63,11 +63,11 @@ int main(int argc, char** argv) {
         ParserCallbacks cb;
         cb.on_add_order = [&](const AddOrder& m) {
             const std::string& sym = locate_to_ticker[m.header.stock_locate];
-            sink += sym.size();
+            sink = sink + sym.size();
         };
         cb.on_add_order_mpid = [&](const AddOrderMPID& m) {
             const std::string& sym = locate_to_ticker[m.header.stock_locate];
-            sink += sym.size();
+            sink = sink + sym.size();
         };
 
         double t0 = now_seconds();
@@ -92,11 +92,11 @@ int main(int argc, char** argv) {
         ParserCallbacks cb;
         cb.on_add_order = [&](const AddOrder& m) {
             const std::string& sym = locate_to_ticker[m.header.stock_locate];
-            sink += market.resting_order_count(sym); // triggers find(), discards result
+            sink = sink + market.resting_order_count(sym); // triggers find(), discards result
         };
         cb.on_add_order_mpid = [&](const AddOrderMPID& m) {
             const std::string& sym = locate_to_ticker[m.header.stock_locate];
-            sink += market.resting_order_count(sym);
+            sink = sink + market.resting_order_count(sym);
         };
 
         double t0 = now_seconds();

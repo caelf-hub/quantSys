@@ -1,0 +1,4 @@
+Total messages in file: 268744780
+Frames: short=0 truncated_tail=0
+Events applied across all symbols: 208309181
+Drops: price_out_of_band=24343845 pool_exhausted=0 unknown_order=30588911 duplicate_order=0

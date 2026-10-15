@@ -55,14 +55,15 @@ private:
     MatchingEngine engine_;
     RiskEngine risk_;
 
-    // Uses the opposite side's best price as the collar reference --
-    // a buy is checked against the best ask, a sell against the best
-    // bid, matching how a real pre-trade check would reference the
-    // prevailing market. Falls back to 0 (collar skipped) if no
-    // opposite-side liquidity exists yet.
+    // Prefer the opposite side (a buy against the ask, a sell against
+    // the bid). If that side is empty, use the same side's best so a
+    // one-sided book still collars a stub quote. Skip only when the
+    // book has no price at all.
     uint32_t reference_price_for(char side) const {
-        double ref = (side == 'B') ? engine_.best_ask() : engine_.best_bid();
-        if (ref < 0) return 0;
+        double opposite = (side == 'B') ? engine_.best_ask() : engine_.best_bid();
+        double same_side = (side == 'B') ? engine_.best_bid() : engine_.best_ask();
+        double ref = (opposite >= 0.0) ? opposite : same_side;
+        if (ref < 0.0) return 0;
         return static_cast<uint32_t>(ref * 10000.0 + 0.5);
     }
 };

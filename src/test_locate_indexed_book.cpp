@@ -34,6 +34,8 @@ int main() {
     // --- Test 3: locates remain fully isolated ---
     assert(market.resting_order_count(1) == 1);
     assert(market.resting_order_count(2) == 2);
+    assert(market.applied_events(1) == 1);
+    assert(market.applied_events(2) == 2);
     assert(!market.has_locate(3)); // never touched
     std::cout << "[PASS] locates remain isolated from each other\n";
 
@@ -44,6 +46,34 @@ int main() {
     // outside a $1000-wide band from 199999.99 should be rejected.
     assert(!market.add_order(3, 6, 'B', px(1.00), 100));
     std::cout << "[PASS] stub-quote band-width clamp still applies in locate-indexed version\n";
+
+    // The two rejects above are both outside a locate's own band.
+    assert(market.drop_counts().price_out_of_band == 2);
+    std::cout << "[PASS] locate book reports out-of-band drops from child books\n";
+
+    LocateIndexedBook tiny(px(0.01), 0.5, /*max_orders_per_symbol=*/1);
+    assert(tiny.add_order(1, 10, 'B', px(10.00), 100));
+    assert(!tiny.add_order(1, 11, 'B', px(10.01), 100));
+    assert(tiny.drop_counts().pool_exhausted == 1);
+    assert(!tiny.delete_order(1, 99));
+    assert(!tiny.cancel_shares(4, 1, 1));
+    assert(!tiny.execute_shares(4, 1, 1));
+    assert(tiny.drop_counts().unknown_order == 3);
+    std::cout << "[PASS] pool exhaustion and unknown orders aggregate across locates\n";
+
+    // A zero first price once made band_max < band_min, and the unsigned
+    // ladder size wrapped to ~43M levels per side.
+    LocateIndexedBook zero(px(0.01), 0.5, /*max_orders_per_symbol=*/8);
+    assert(!zero.add_order(7, 1, 'B', 0, 100));
+    assert(zero.ladder_ticks(7) <= 2);
+    assert(zero.drop_counts().price_out_of_band == 1);
+    std::cout << "[PASS] zero first price builds a bounded ladder and drops the add\n";
+
+    // first + half overflowing uint32 must saturate, not wrap below band_min.
+    const uint32_t near_max = UINT32_MAX - 100;
+    assert(zero.add_order(8, 2, 'S', near_max, 100));
+    assert(zero.ladder_ticks(8) > 1 && zero.ladder_ticks(8) <= 200001);
+    std::cout << "[PASS] near-max first price saturates the band instead of wrapping\n";
 
     std::cout << "All LocateIndexedBook tests passed.\n";
     return 0;

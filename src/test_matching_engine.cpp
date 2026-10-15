@@ -116,6 +116,46 @@ int main() {
         std::cout << "[PASS] cancel removes resting order and recomputes best price\n";
     }
 
+    // --- Test 7: best bid falls back across a price gap ---
+    {
+        MatchingEngine eng(px(100.00), px(200.00), px(0.01), 100);
+        std::vector<Fill> fills;
+        eng.submit_order(1, 'B', px(150.00), 10, fills);
+        eng.submit_order(2, 'B', px(110.00), 10, fills);
+        assert(eng.cancel_order(1));
+        assert(approx_eq(eng.best_bid(), 110.00));
+        eng.submit_order(3, 'S', px(151.00), 10, fills);
+        eng.submit_order(4, 'S', px(190.00), 10, fills);
+        assert(eng.cancel_order(3));
+        assert(approx_eq(eng.best_ask(), 190.00));
+        std::cout << "[PASS] best price jumps a gap after the inside level empties\n";
+    }
+
+    // --- Test 8: resting size is the sum of shares at the best level ---
+    {
+        MatchingEngine eng(px(100.00), px(200.00), px(0.01), 100);
+        std::vector<Fill> fills;
+        eng.submit_order(1, 'S', px(150.00), 50, fills);
+        eng.submit_order(2, 'S', px(150.00), 50, fills);
+        assert(eng.best_ask_shares() == 100);
+        fills.clear();
+        eng.submit_order(3, 'B', px(150.00), 10, fills);
+        assert(eng.best_ask_shares() == 90);
+        std::cout << "[PASS] resting ask shares include every order at the touch\n";
+    }
+
+    // --- Test 9: a full pool records the drop instead of forgetting the remainder ---
+    {
+        MatchingEngine eng(px(100.00), px(200.00), px(0.01), 1);
+        std::vector<Fill> fills;
+        assert(eng.submit_order(1, 'S', px(150.00), 10, fills));
+        assert(eng.submit_order(2, 'S', px(151.00), 10, fills));
+        assert(eng.pool_exhausted() == 1);
+        assert(eng.resting_order_count() == 1);
+        assert(approx_eq(eng.best_ask(), 150.00));
+        std::cout << "[PASS] pool exhaustion is counted and the resting order stays\n";
+    }
+
     std::cout << "All MatchingEngine tests passed.\n";
     return 0;
 }

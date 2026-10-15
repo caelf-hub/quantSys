@@ -1,0 +1,12 @@
+---
+description: Historical research only; no live orders or hidden costs
+alwaysApply: true
+---
+
+# Research boundary
+
+- Replay historical ITCH and simulate. Do not add an order gateway or a broker client.
+- Every signal report includes drop counts and a cost haircut. Half the spread is a lower bound, not a fill. Say that queue position and adverse selection are not modeled.
+- Do not hide truncated books. Liquid names hit the per-symbol pool cap; the study uses one symbol with a large pool instead of raising the full-market cap.
+- Do not describe a decile table as a tradable edge.
+- CSV output stays under `data/` (gitignored). Do not commit market data.

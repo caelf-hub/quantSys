@@ -144,6 +144,8 @@ int main(int argc, char** argv) {
 
     std::cout << "\n=== Final state for " << requested_ticker << " ===\n";
     std::cout << "Total messages in file: " << total << "\n";
+    std::cout << "Frames: short=" << reader.frame_stats().short_frames
+              << " truncated_tail=" << reader.frame_stats().truncated_tail << "\n";
     std::cout << "Events applied to this symbol: " << applied << "\n";
     std::cout << "Events rejected (price outside ladder range): " << rejected << "\n";
     std::cout << "Resting orders remaining: " << ob.resting_order_count() << "\n";
